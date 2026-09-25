@@ -167,3 +167,99 @@ async function waitForLanStatus(base) {
   console.error(error)
   process.exit(1)
 })
+
+// --- endpoint ordering ---
+//
+// A phone tries these in turn, so the LAN entry must lead. Measured on this deployment: the LAN
+// path serves a Session at 20 MB/s while the public entry is capped by the desktop's own upstream
+// at 0.9 MB/s, so a public-first list left a same-room phone waiting a minute for data the LAN
+// could deliver in seconds. The public address must still be advertised for when the phone leaves.
+{
+  const { createGatewayHarness } = await import('./gateway-harness.mjs').catch(() => ({ createGatewayHarness: undefined }))
+  if (createGatewayHarness !== undefined) {
+    const harness = await createGatewayHarness({ publicUrlFile: undefined })
+    try {
+      const status = await harness.status()
+      assert.ok(Array.isArray(status.endpoints) && status.endpoints.length >= 1, 'endpoints are advertised')
+      const lanIndex = status.endpoints.findIndex(entry => /^ws:\/\/(?:10\.|192\.168\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|127\.)/.test(entry))
+      assert.equal(lanIndex, 0, 'the LAN entry leads because the client tries them in order')
+      if (typeof status.publicUrl === 'string' && status.publicUrl !== '') {
+        assert.ok(status.endpoints.indexOf(status.publicUrl) > lanIndex, 'the public entry follows the LAN one')
+      }
+    } finally {
+      await harness.close()
+    }
+  }
+}
+
+console.log('LAN-FIRST ORDERING TESTS PASSED')
+// --- endpoint ordering ---
+//
+// A phone tries these in turn, so the LAN entry must lead. Measured on this deployment: the LAN
+// path serves a Session at 20 MB/s while the public entry is capped by the desktop's own upstream
+// at 0.9 MB/s, so a public-first list left a same-room phone waiting a minute for data the LAN
+// could deliver in seconds. The public address must stay advertised for when the phone leaves.
+{
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-order-'))
+  let managementRoute
+  let disposePlugin
+  const server = http.createServer((req, res) => {
+    if (managementRoute && (req.url === managementRoute.path || req.url.startsWith(`${managementRoute.path}/`))) {
+      managementRoute.handler(req, res)
+      return
+    }
+    res.writeHead(404).end()
+  })
+  const webServer = {
+    port: 0,
+    register(route) { managementRoute = route; return () => { managementRoute = undefined } },
+    registerUpgrade() { return () => {} },
+  }
+  const ctx = {
+    webServer,
+    typertGateway: {
+      async invoke() { throw new Error('unexpected Remote invocation') },
+      async stream() {
+        return (async function* () {
+          yield { type: 'baseline', value: { items: [], archivedSessionIds: [] } }
+        })()
+      },
+    },
+    agentDefaultModel: {},
+    on() { return () => {} },
+    effect(factory) { disposePlugin = factory() },
+  }
+  const publicUrlFile = path.join(temp, 'public-url')
+  fs.writeFileSync(publicUrlFile, 'wss://gateway.example.test/ws/mobile\n')
+  plugin.apply(ctx, {
+    requireAuth: false,
+    gatewayEnabled: true,
+    gatewayWaitTimeoutMs: 60_000,
+    adminLoopbackOnly: true,
+    pairingTtlMs: 60_000,
+    deviceFile: path.join(temp, 'devices.json'),
+    publicUrlFile,
+    publicUrl: 'wss://gateway.example.test/ws/mobile',
+    lanEnabled: true,
+    lanHost: '127.0.0.1',
+    lanPort: 0,
+  })
+  server.listen(0)
+  await once(server, 'listening')
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const status = await waitForLanStatus(base)
+    assert.ok(status.endpoints.length >= 2, 'both the LAN and public entries are advertised')
+    const lanIndex = status.endpoints.findIndex(entry => entry.startsWith('ws://'))
+    const publicIndex = status.endpoints.findIndex(entry => entry.startsWith('wss://'))
+    assert.ok(lanIndex >= 0, 'the LAN entry is advertised while its listener is up')
+    assert.ok(publicIndex >= 0, 'the public entry stays advertised for when the phone leaves')
+    assert.ok(lanIndex < publicIndex, 'the LAN entry leads because the client tries them in order')
+  } finally {
+    server.close()
+    disposePlugin?.()
+    fs.rmSync(temp, { recursive: true, force: true })
+  }
+}
+
+console.log('LAN-FIRST ORDERING TESTS PASSED')

@@ -1,6 +1,6 @@
 {
   "name": "@sparkelf/dsh-plugin-mobile-gateway",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Mobile gateway for DSH 0.1.7 (Session format 4), carrying the fork's format adaptation: v3 rows are lifted on read so a Session written by an earlier release still opens. Per-session Agent preset selection, live preset updates, and the upstream LAN/pairing protocol are unchanged.",
   "main": "lib/index.mjs",
   "files": [

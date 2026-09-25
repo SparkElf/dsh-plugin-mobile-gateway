@@ -4,7 +4,7 @@
 # Gateway and the `session/event` feed, and publishes no service of its own).
 - insert:
     - id: mobile-gateway
-      name: 'dsh-plugin-mobile-gateway'
+      name: '@sparkelf/dsh-plugin-mobile-gateway'
       config:
         # Secure by default: every mobile WebSocket must authenticate with a
         # paired device credential. Pair/revoke APIs remain local-machine only.
@@ -27,7 +27,9 @@
         lanEnabled: true
         lanHost: 0.0.0.0
         lanPort: 3081
-        # Written automatically by `sudo npx dsh-plugin-mobile-gateway setup`.
+        # The public WebSocket address phones dial from outside the LAN. A plain file so a
+        # deployment that terminates TLS elsewhere (a reverse proxy, an frp tunnel) can state its
+        # own entry without installing the privileged Helper; `setup` writes this same path.
         publicUrlFile: /etc/dsh-mobile-gateway/public-url
 
 # The gateway's `search` query channel needs the full-text session index,

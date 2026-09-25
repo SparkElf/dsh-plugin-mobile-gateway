@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { createDshHostAdapter, readHistoryRecords } from '../lib/dsh-host-adapter.mjs'
+import { createDshHostAdapter, liftEventMessages, liftMessageSource, readHistoryRecords, readSessionSnapshot, SESSION_FORMAT_VERSION_MAX } from '../lib/dsh-host-adapter.mjs'
 
 const gatewaySource = fs.readFileSync(new URL('../lib/index.mjs', import.meta.url), 'utf8')
 assert.doesNotMatch(gatewaySource, /apiProxy|api\.events\.mux|api\.respond\s*\(/)
@@ -192,3 +192,113 @@ await assert.rejects(() => badHost.sessions.history({ sessionId: 's1' }), { code
   assert.equal(returned, true)
   assert.equal(caller.signal.aborted, false)
 }
+
+// --- Session format 4 ---
+//
+// DSH 0.1.7 stores format 4. A v3 row keeps the retired `source.kind: "plugin"` wrapper, which the
+// v4 decoder refuses outright, and a v3 `tool/result` omits the tool role v4 requires. Both are
+// lifted on read; measured against a real Session that carried 3 wrapped sources and 49 role-less
+// tool results.
+
+assert.equal(typeof SESSION_FORMAT_VERSION_MAX, 'number')
+assert.ok(SESSION_FORMAT_VERSION_MAX >= 4, 'the adapter must read the current Session format')
+
+// A plugin source becomes the producer's own kind, and the retired key is dropped.
+assert.deepEqual(
+  liftMessageSource({ role: 'system', source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } }),
+  { role: 'system', source: { kind: 'system-prompt' } },
+)
+// The same plugin on a non-system role is the runtime context it actually emitted.
+assert.deepEqual(
+  liftMessageSource({ role: 'user', source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' } }),
+  { role: 'user', source: { kind: 'runtime-context', form: 'snapshot' } },
+)
+// A plugin whose name is already the producer kind keeps it.
+assert.deepEqual(
+  liftMessageSource({ role: 'user', source: { kind: 'plugin', plugin: 'dsh-session-title-llm' } }),
+  { role: 'user', source: { kind: 'dsh-session-title-llm' } },
+)
+// A direct producer kind is returned unchanged, identity included.
+const direct = { role: 'assistant', source: { kind: 'model' } }
+assert.equal(liftMessageSource(direct), direct)
+// An unrecognized plugin still yields a producer-owned kind rather than the refused wrapper.
+assert.deepEqual(
+  liftMessageSource({ source: { kind: 'plugin', plugin: 'some-other-plugin' } }),
+  { source: { kind: 'plugin:some-other-plugin' } },
+)
+
+// A released wrapper result becomes the first-class tool message v4 requires: the nested block is
+// unpacked, the wrapper's fields are hoisted, and everything else survives under a plugin prefix.
+// Measured against a real Session whose 49 wrapper results all converted.
+assert.deepEqual(
+  liftEventMessages({
+    type: 'tool/result',
+    data: {
+      message: {
+        id: 'm1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'c1' },
+        content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] }],
+      },
+    },
+  }),
+  {
+    type: 'tool/result',
+    data: {
+      message: {
+        role: 'tool',
+        id: 'm1',
+        source: { kind: 'tool', callId: 'c1' },
+        toolCallId: 'c1',
+        content: [{ type: 'text', text: 'ok' }],
+      },
+    },
+  },
+)
+// A result already in the v4 shape is returned by identity.
+const firstClass = { type: 'tool/result', data: { message: { role: 'tool', id: 'm1', source: { kind: 'tool' }, toolCallId: 'c1', content: [] } } }
+assert.equal(liftEventMessages(firstClass), firstClass)
+// A wrapper whose block does not match its source call id is left alone rather than mis-hoisted.
+const mismatched = { type: 'tool/result', data: { message: { role: 'user', source: { kind: 'tool', callId: 'a' }, content: [{ type: 'tool-result', toolCallId: 'b', content: [] }] } } }
+assert.equal(liftEventMessages(mismatched), mismatched)
+// isError hoists when present.
+const errored = liftEventMessages({
+  type: 'tool/result',
+  data: { message: { id: 'm2', role: 'user', source: { kind: 'tool', callId: 'c2' }, content: [{ type: 'tool-result', toolCallId: 'c2', content: [], isError: true }] } },
+})
+assert.equal(errored.data.message.isError, true)
+assert.equal(errored.data.message.role, 'tool')
+
+// An event with nothing to lift is returned by identity, so a steady-state read allocates nothing.
+const clean = { type: 'assistant/message', data: { message: { role: 'assistant', source: { kind: 'model' } } } }
+assert.equal(liftEventMessages(clean), clean)
+
+// An inbox carries a message array; every entry is lifted.
+const inbox = liftEventMessages({
+  type: 'agent/inbox/spliced',
+  data: { inserted: [{ source: { kind: 'plugin', plugin: 'dsh-session-title-llm' } }] },
+})
+assert.deepEqual(inbox.data.inserted, [{ source: { kind: 'dsh-session-title-llm' } }])
+
+// A snapshot at format 4 is accepted, and its records arrive lifted.
+const snapshot4 = readSessionSnapshot({
+  type: 'snapshot',
+  cursor: 10,
+  hasMore: false,
+  header: { id: 's1', version: 4 },
+  projections: {},
+  records: [{ type: 'event', event: { type: 'tool/result', seq: 3, data: { message: { id: 'm3', role: 'user', source: { kind: 'tool', callId: 'c3' }, content: [{ type: 'tool-result', toolCallId: 'c3', content: [] }] } } } }],
+}, 's1')
+assert.equal(snapshot4.historyFormatVersion, 4)
+assert.equal(snapshot4.events[0].event.data.message.role, 'tool')
+
+// A format above the supported ceiling is refused rather than misread.
+assert.throws(
+  () => readSessionSnapshot({
+    type: 'snapshot', cursor: 0, hasMore: false, header: { id: 's1', version: SESSION_FORMAT_VERSION_MAX + 1 },
+    projections: {}, records: [],
+  }, 's1'),
+  /unsupported-session-format|reads Session format/,
+)
+
+console.log('SESSION FORMAT 4 TESTS PASSED')

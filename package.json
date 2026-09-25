@@ -1,7 +1,7 @@
 {
-  "name": "dsh-plugin-mobile-gateway",
-  "version": "0.7.7",
-  "description": "Mobile gateway for dsh 0.1.5-rc.1/2 with per-session Agent preset selection before the first conversation, automatic preset locking after conversation starts, and live preset updates",
+  "name": "@sparkelf/dsh-plugin-mobile-gateway",
+  "version": "0.8.0",
+  "description": "Mobile gateway for DSH 0.1.7 (Session format 4), carrying the fork's format adaptation: v3 rows are lifted on read so a Session written by an earlier release still opens. Per-session Agent preset selection, live preset updates, and the upstream LAN/pairing protocol are unchanged.",
   "main": "lib/index.mjs",
   "files": [
     "bin",
@@ -13,7 +13,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway.git"
+    "url": "git+https://github.com/SparkElf/dsh-plugin-mobile-gateway.git"
   },
   "homepage": "https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway#readme",
   "bugs": {

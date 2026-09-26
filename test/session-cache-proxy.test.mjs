@@ -90,6 +90,16 @@ try {
   assert.equal(answer.events[1].data.stream, undefined)
   assert.equal(answer.view, 'conversation')
 
+  // Every forwarded frame must already be framed: the upstream socket is a raw stream, and bare
+  // JSON corrupts the header ('{' is 0x7B, whose RSV2 and RSV3 bits are both set).
+  const frameBytes = Buffer.from(forwarded.join(''), 'latin1')
+  if (frameBytes.length > 0) {
+    const first = frameBytes[0]
+    assert.equal((first >> 5) & 1, 0, 'RSV2 must be clear on a forwarded frame')
+    assert.equal((first >> 4) & 1, 0, 'RSV3 must be clear on a forwarded frame')
+    assert.equal(first & 0x0f, 0x1, 'a forwarded frame is text')
+  }
+
   // An uncached Session is forwarded upstream rather than answered here.
   const before = forwarded.length
   ws.send(JSON.stringify({ type: 'history', sessionId: 'session-not-cached' }))
@@ -111,3 +121,62 @@ try {
   upstream.close()
   fs.rmSync(temp, { recursive: true, force: true })
 }
+
+// --- upstream framing ---
+//
+// The socket an 'upgrade' event hands back is a raw TCP stream, so everything written to it must
+// already be framed. Writing bare JSON corrupts silently: the first payload byte becomes the frame
+// header, and '{' is 0x7B = FIN 0, RSV1 1, RSV2 1, RSV3 1, opcode 0xB, which the receiving parser
+// rejects as WS_ERR_UNEXPECTED_RSV_2_3. A phone doing this read as the App sending malformed
+// frames; the bytes came from this proxy.
+{
+  const { spawn } = require('node:child_process')
+  const stored = []
+  const upstream = http.createServer((_r, res) => { res.writeHead(404).end() })
+  upstream.on('upgrade', (request, socket) => {
+    const k = request.headers['sec-websocket-key']
+    const a = createHash('sha1').update(k + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + a + '\r\n\r\n')
+    socket.on('data', (chunk) => stored.push(chunk))
+  })
+  upstream.listen(0, '127.0.0.1')
+  await new Promise((resolve) => upstream.once('listening', resolve))
+  const upstreamPort = upstream.address().port
+  const proxyPort = 17590 + Math.floor(Math.random() * 50)
+  const proxy = spawn(process.execPath, [
+    new URL('../bin/session-cache-proxy.mjs', import.meta.url).pathname,
+    '--port', String(proxyPort), '--root', cacheRoot,
+    '--upstream', 'http://127.0.0.1:' + String(upstreamPort),
+  ], { stdio: ['ignore', 'pipe', 'pipe'] })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const ws = await new Promise((resolve, reject) => {
+      const client = new WebSocket('ws://127.0.0.1:' + String(proxyPort) + '/ws/mobile')
+      const timer = setTimeout(() => { client.terminate(); reject(new Error('connect timed out')) }, 5000)
+      client.once('open', () => { clearTimeout(timer); resolve(client) })
+      client.once('error', (error) => { clearTimeout(timer); reject(error) })
+    })
+    // A frame with no cached answer and one that is not a history request both go upstream.
+    ws.send(JSON.stringify({ type: 'sessions' }))
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    ws.close()
+    const bytes = Buffer.concat(stored)
+    console.log('    DEBUG upstream bytes:', bytes.length, bytes.length > 0 ? '0x' + bytes[0].toString(16) : '')
+    assert.ok(bytes.length > 0, 'the frame reached the upstream')
+    // Surface what actually arrived when the assertion below fails.
+    if (((bytes[0] >> 5) & 1) === 1) console.log('    received first byte: 0x' + bytes[0].toString(16))
+    const header = bytes[0]
+    assert.equal((header >> 5) & 1, 0, 'RSV2 must be clear on a forwarded frame')
+    assert.equal((header >> 4) & 1, 0, 'RSV3 must be clear on a forwarded frame')
+    assert.equal(header & 0x0f, 0x1, 'the forwarded frame is text')
+    // And it decodes back to the payload that was sent.
+    const length = bytes[1] & 0x7f
+    const payload = bytes.subarray(2, 2 + length).toString('utf8')
+    assert.deepEqual(JSON.parse(payload), { type: 'sessions' })
+  } finally {
+    proxy.kill()
+    upstream.close()
+  }
+}
+
+console.log('UPSTREAM FRAMING TESTS PASSED')

@@ -59,7 +59,57 @@ function tokenHashes() {
   } catch { return new Set() }
 }
 
+/**
+ * Write to a socket that may already be gone.
+ *
+ * `destroyed` is checked before the write but the peer can disappear between the check and the
+ * write, and a write to a closed socket emits an 'error' that, unhandled, ends the process — one
+ * phone hanging up took this proxy down (EPIPE from FrameReader.onFrame). Every write on a
+ * connection the peer controls goes through here.
+ *
+ * @param socket - the stream to write to; may be destroyed or undefined.
+ * @param payload - bytes or text to send.
+ * @returns whether the write was attempted.
+ */
+function safeWrite(socket, payload) {
+  if (socket === undefined || socket === null || socket.destroyed === true || socket.writable === false) return false
+  try {
+    socket.write(payload)
+    return true
+  } catch {
+    try { socket.destroy() } catch {}
+    return false
+  }
+}
+
 const frame = {
+  /**
+   * Wrap an already-serialized payload in one unmasked text frame.
+   *
+   * The upstream socket from an 'upgrade' event is a raw TCP stream, not a WebSocket object, so
+   * anything written to it must already be framed. Writing the bare JSON text instead is a silent
+   * corruption: the payload's first byte becomes the frame header, and '{' is 0x7B = FIN 0, RSV1 1,
+   * RSV2 1, RSV3 1, opcode 0xB — which the receiving parser rejects as "RSV2 and RSV3 must be
+   * clear" and closes the connection over.
+   */
+  encodeText(text) {
+    const payload = Buffer.from(text, 'utf8')
+    if (payload.length < 126) {
+      return Buffer.concat([Buffer.from([0x81, payload.length]), payload])
+    }
+    if (payload.length < 65536) {
+      const header = Buffer.alloc(4)
+      header[0] = 0x81
+      header[1] = 126
+      header.writeUInt16BE(payload.length, 2)
+      return Buffer.concat([header, payload])
+    }
+    const header = Buffer.alloc(10)
+    header[0] = 0x81
+    header[1] = 127
+    header.writeBigUInt64BE(BigInt(payload.length), 2)
+    return Buffer.concat([header, payload])
+  },
   /** Encode one server frame. Payloads are text by construction. */
   encode(value) {
     const payload = Buffer.from(JSON.stringify(value), 'utf8')
@@ -269,7 +319,7 @@ server.on('upgrade', (request, socket, head) => {
     // asked for dsh-mobile-v1 must see it echoed or it will not treat the socket as established.
     const accept = response2.headers['sec-websocket-accept']
     const protocol = response2.headers['sec-websocket-protocol']
-    socket.write(
+    safeWrite(socket,
       'HTTP/1.1 101 Switching Protocols\r\n'
       + 'Upgrade: websocket\r\n'
       + 'Connection: Upgrade\r\n'
@@ -277,11 +327,14 @@ server.on('upgrade', (request, socket, head) => {
       + (protocol === undefined ? '' : 'Sec-WebSocket-Protocol: ' + String(protocol) + '\r\n')
       + '\r\n',
     )
-    if (head.length > 0) liveSocket.write(head)
-    if (liveHead.length > 0) socket.write(liveHead)
+    // `head` holds leftover bytes the client sent after its handshake, already framed.
+    if (head.length > 0) safeWrite(liveSocket, head)
+    if (liveHead.length > 0) safeWrite(socket, liveHead)
 
     const liveReader = new FrameReader((text) => {
-      if (!socket.destroyed) socket.write(frame.encode(JSON.parse(text)))
+      let parsed
+      try { parsed = JSON.parse(text) } catch { return }
+      safeWrite(socket, frame.encode(parsed))
     }, () => {})
     liveSocket.on('data', (chunk) => liveReader.push(chunk))
     liveSocket.on('close', () => { if (!socket.destroyed) socket.destroy() })
@@ -291,16 +344,16 @@ server.on('upgrade', (request, socket, head) => {
     // local storage, and every other frame is forwarded unchanged.
     const clientReader = new FrameReader((text) => {
       let message
-      try { message = JSON.parse(text) } catch { liveSocket.write(text); return }
+      try { message = JSON.parse(text) } catch { safeWrite(liveSocket, frame.encodeText(text)); return }
       if (message?.type === 'history' && typeof message.sessionId === 'string') {
         let cached
         try { cached = cachedEvents(message.sessionId) } catch { cached = undefined }
         if (cached !== undefined && cached.events.length > 0) {
-          socket.write(frame.encode(historyFrame(message, cached)))
+          safeWrite(socket, frame.encode(historyFrame(message, cached)))
           return
         }
       }
-      liveSocket.write(text)
+      safeWrite(liveSocket, frame.encodeText(text))
     }, (kind) => { if (kind === 'close') liveSocket.destroy() })
     socket.on('data', (chunk) => clientReader.push(chunk))
   })
@@ -313,20 +366,17 @@ server.on('upgrade', (request, socket, head) => {
     response2.on('end', () => {
       if (socket.destroyed) return
       const body = Buffer.concat(chunks)
-      socket.write('HTTP/1.1 ' + String(response2.statusCode ?? 502) + ' ' + String(response2.statusMessage ?? 'Bad Gateway') + '\r\nContent-Length: ' + String(body.length) + '\r\nConnection: close\r\n\r\n')
-      socket.end(body)
+      if (safeWrite(socket, 'HTTP/1.1 ' + String(response2.statusCode ?? 502) + ' ' + String(response2.statusMessage ?? 'Bad Gateway') + '\r\nContent-Length: ' + String(body.length) + '\r\nConnection: close\r\n\r\n')) socket.end(body)
     })
   })
   live.on('error', () => {
     if (socket.destroyed) return
-    socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n')
-    socket.end()
+    if (safeWrite(socket, 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n')) socket.end()
   })
   live.setTimeout(20000, () => {
     live.destroy()
     if (!socket.destroyed) {
-      socket.write('HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n')
-      socket.end()
+      if (safeWrite(socket, 'HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n')) socket.end()
     }
   })
   live.end()

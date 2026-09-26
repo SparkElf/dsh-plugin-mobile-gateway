@@ -1,6 +1,6 @@
 {
   "name": "@sparkelf/dsh-plugin-mobile-gateway",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Mobile gateway for DSH 0.1.7 (Session format 4) with an entry-VPS Session cache. Reads DSH 0.1.7 Session format 4 and lifts retired v3 message shapes on read; a companion cache service plus gateway proxy let a phone fetch history from the entry host at 109 MB/s instead of through the desktop's 0.9 MB/s upstream. Per-session Agent preset selection, live preset updates, and the upstream LAN/pairing protocol are unchanged.",
   "main": "lib/index.mjs",
   "files": [

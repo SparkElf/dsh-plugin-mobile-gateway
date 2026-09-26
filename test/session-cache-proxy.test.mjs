@@ -77,7 +77,11 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 500))
   const ws = await connect()
 
-  // A cached Session answers from local storage: the events come back shaped as a conversation view.
+  // The history answer must declare the same Session format the gateway announced in its hello
+  // frame. The client checks one against the other, so a mismatch makes it reject every page and
+  // sit on "loading history" — which is what a proxy announcing the newest format it knew about did,
+  // while the gateway it fronted announced an older one.
+  //
   const asked = next(ws)
   ws.send(JSON.stringify({ type: 'history', sessionId: SESSION_ID, view: 'conversation' }))
   const answer = await asked
@@ -89,6 +93,11 @@ try {
   // The stream field is dropped on assistant messages.
   assert.equal(answer.events[1].data.stream, undefined)
   assert.equal(answer.view, 'conversation')
+  assert.equal(
+    answer.historyFormatVersion,
+    3,
+    'the history answer declares the Session format the gateway announces in its hello frame',
+  )
 
   // Every forwarded frame must already be framed: the upstream socket is a raw stream, and bare
   // JSON corrupts the header ('{' is 0x7B, whose RSV2 and RSV3 bits are both set).
@@ -131,13 +140,18 @@ try {
 // frames; the bytes came from this proxy.
 {
   const { spawn } = require('node:child_process')
-  const stored = []
+  // A real WebSocket server, not a bare socket: this is what parses the forwarded frame, so it is
+  // what rejects an unmasked one (WS_ERR_EXPECTED_MASK) or a stray reserved bit. A raw collector
+  // would accept anything and prove nothing.
+  const { WebSocketServer } = require('ws')
+  const received = []
   const upstream = http.createServer((_r, res) => { res.writeHead(404).end() })
-  upstream.on('upgrade', (request, socket) => {
-    const k = request.headers['sec-websocket-key']
-    const a = createHash('sha1').update(k + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
-    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + a + '\r\n\r\n')
-    socket.on('data', (chunk) => stored.push(chunk))
+  const wss = new WebSocketServer({ noServer: true })
+  upstream.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      ws.on('message', (data) => received.push(data.toString('utf8')))
+      ws.on('error', (error) => received.push('ERROR:' + String(error.code ?? error.message)))
+    })
   })
   upstream.listen(0, '127.0.0.1')
   await new Promise((resolve) => upstream.once('listening', resolve))
@@ -160,19 +174,11 @@ try {
     ws.send(JSON.stringify({ type: 'sessions' }))
     await new Promise((resolve) => setTimeout(resolve, 500))
     ws.close()
-    const bytes = Buffer.concat(stored)
-    console.log('    DEBUG upstream bytes:', bytes.length, bytes.length > 0 ? '0x' + bytes[0].toString(16) : '')
-    assert.ok(bytes.length > 0, 'the frame reached the upstream')
-    // Surface what actually arrived when the assertion below fails.
-    if (((bytes[0] >> 5) & 1) === 1) console.log('    received first byte: 0x' + bytes[0].toString(16))
-    const header = bytes[0]
-    assert.equal((header >> 5) & 1, 0, 'RSV2 must be clear on a forwarded frame')
-    assert.equal((header >> 4) & 1, 0, 'RSV3 must be clear on a forwarded frame')
-    assert.equal(header & 0x0f, 0x1, 'the forwarded frame is text')
-    // And it decodes back to the payload that was sent.
-    const length = bytes[1] & 0x7f
-    const payload = bytes.subarray(2, 2 + length).toString('utf8')
-    assert.deepEqual(JSON.parse(payload), { type: 'sessions' })
+    // The upstream ws parser accepts the frame only if it is well formed: masked, text, no reserved
+    // bits. A parse failure surfaces as an 'error' entry rather than a message.
+    assert.deepEqual(received.filter((entry) => entry.startsWith('ERROR:')), [], 'the upstream accepted every forwarded frame')
+    assert.ok(received.length > 0, 'the frame reached the upstream')
+    assert.deepEqual(JSON.parse(received[0]), { type: 'sessions' }, 'the upstream decoded the payload intact')
   } finally {
     proxy.kill()
     upstream.close()

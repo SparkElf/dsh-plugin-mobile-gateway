@@ -19,7 +19,7 @@
  *   session-cache-proxy.mjs [--port 7091] [--root /var/lib/dsh-mobile-cache]
  *                           [--upstream http://127.0.0.1:3080] [--ws-path /ws/mobile]
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
@@ -34,6 +34,9 @@ let upstream = process.env.DSH_UPSTREAM ?? 'http://127.0.0.1:3080'
 let upstreamHost = process.env.DSH_UPSTREAM_HOST ?? ''
 let wsPath = process.env.DSH_WS_PATH ?? '/ws/mobile'
 let tokensFile = process.env.DSH_CACHE_TOKENS ?? ''
+// When set, every frame's kind and size is logged. Used to see what a client actually asked for and
+// what it was given, which is the only way to tell a client that is waiting from one that is retrying.
+const trace = process.env.DSH_PROXY_TRACE === '1'
 for (let index = 0; index < argv.length; index += 1) {
   const arg = argv[index]
   if (arg === '--port') { port = Number(argv[++index]); continue }
@@ -84,31 +87,38 @@ function safeWrite(socket, payload) {
 
 const frame = {
   /**
-   * Wrap an already-serialized payload in one unmasked text frame.
+   * Wrap an already-serialized payload in one masked text frame.
    *
    * The upstream socket from an 'upgrade' event is a raw TCP stream, not a WebSocket object, so
-   * anything written to it must already be framed. Writing the bare JSON text instead is a silent
-   * corruption: the payload's first byte becomes the frame header, and '{' is 0x7B = FIN 0, RSV1 1,
-   * RSV2 1, RSV3 1, opcode 0xB — which the receiving parser rejects as "RSV2 and RSV3 must be
-   * clear" and closes the connection over.
+   * anything written to it must already be framed. Bare JSON corrupts the header instead: the first
+   * payload byte reads as the frame header, and '{' is 0x7B = FIN 0, RSV1 1, RSV2 1, RSV3 1,
+   * opcode 0xB, which the receiver rejects as "RSV2 and RSV3 must be clear".
+   *
+   * It must also be *masked*. In this direction the proxy is the client, and RFC 6455 requires
+   * client-to-server frames to carry a mask — a server rejects an unmasked one with
+   * WS_ERR_EXPECTED_MASK and closes the connection, which the phone sees as a failed login.
    */
-  encodeText(text) {
+  encodeClientText(text) {
     const payload = Buffer.from(text, 'utf8')
-    if (payload.length < 126) {
-      return Buffer.concat([Buffer.from([0x81, payload.length]), payload])
+    const mask = randomBytes(4)
+    const length = payload.length
+    let header
+    if (length < 126) {
+      header = Buffer.alloc(2)
+      header[1] = 0x80 | length
+    } else if (length < 65536) {
+      header = Buffer.alloc(4)
+      header[1] = 0x80 | 126
+      header.writeUInt16BE(length, 2)
+    } else {
+      header = Buffer.alloc(10)
+      header[1] = 0x80 | 127
+      header.writeBigUInt64BE(BigInt(length), 2)
     }
-    if (payload.length < 65536) {
-      const header = Buffer.alloc(4)
-      header[0] = 0x81
-      header[1] = 126
-      header.writeUInt16BE(payload.length, 2)
-      return Buffer.concat([header, payload])
-    }
-    const header = Buffer.alloc(10)
     header[0] = 0x81
-    header[1] = 127
-    header.writeBigUInt64BE(BigInt(payload.length), 2)
-    return Buffer.concat([header, payload])
+    const masked = Buffer.from(payload)
+    for (let index = 0; index < masked.length; index += 1) masked[index] ^= mask[index % 4]
+    return Buffer.concat([header, mask, masked])
   },
   /** Encode one server frame. Payloads are text by construction. */
   encode(value) {
@@ -196,6 +206,11 @@ function cachedEvents(sessionId) {
 
 // --- history shaping, mirroring the gateway so a phone cannot tell the difference ---
 //
+// The gateway announces its Session format in the hello frame and the client checks the history
+// answer against it. This must match that announcement, not the newest format the cache happens to
+// hold: the cache stores whatever the desktop wrote, while the handshake is what the client trusts.
+const GATEWAY_HISTORY_FORMAT_VERSION = 3
+//
 // The gateway caps a page at 256 KB on its opening read because every byte travels the desktop's
 // upstream. Here the bytes are already local and the wire is the VPS's own 8.3 MB/s downstream, so
 // the cap only costs round trips: a 10866-event Session would take 118 pages, and at 173 ms RTT
@@ -275,7 +290,11 @@ function historyFrame(message, cached) {
     ...(message.view === 'conversation' ? { view: 'conversation' } : {}),
     ...(capped.hasMore && oldest !== undefined ? { nextBeforeSeq: oldest } : {}),
     cursor: lastSeq,
-    historyFormatVersion: 4,
+    // Must equal what the gateway announced in its own hello frame, which is its
+    // SESSION_FORMAT_VERSION. The client validates the version on the history answer against the one
+    // it was told, so announcing 4 while the gateway says 3 makes it reject every page and stay on
+    // "loading history". The wire can carry either; the handshake is what must agree.
+    historyFormatVersion: GATEWAY_HISTORY_FORMAT_VERSION,
   }
 }
 
@@ -332,6 +351,7 @@ server.on('upgrade', (request, socket, head) => {
     if (liveHead.length > 0) safeWrite(socket, liveHead)
 
     const liveReader = new FrameReader((text) => {
+      if (trace) console.log('trace upstream->client ' + text.slice(0, 200))
       let parsed
       try { parsed = JSON.parse(text) } catch { return }
       safeWrite(socket, frame.encode(parsed))
@@ -343,17 +363,20 @@ server.on('upgrade', (request, socket, head) => {
     // The client's frames are examined: a history request for a cached Session is answered from
     // local storage, and every other frame is forwarded unchanged.
     const clientReader = new FrameReader((text) => {
+      if (trace) console.log('trace client->upstream ' + text.slice(0, 200))
       let message
-      try { message = JSON.parse(text) } catch { safeWrite(liveSocket, frame.encodeText(text)); return }
+      try { message = JSON.parse(text) } catch { safeWrite(liveSocket, frame.encodeClientText(text)); return }
       if (message?.type === 'history' && typeof message.sessionId === 'string') {
         let cached
         try { cached = cachedEvents(message.sessionId) } catch { cached = undefined }
         if (cached !== undefined && cached.events.length > 0) {
-          safeWrite(socket, frame.encode(historyFrame(message, cached)))
+          const answer = historyFrame(message, cached)
+          if (trace) console.log('trace cache->client history sessionId=' + message.sessionId + ' events=' + String(answer.events.length) + ' bytes=' + String(answer.bytes))
+          safeWrite(socket, frame.encode(answer))
           return
         }
       }
-      safeWrite(liveSocket, frame.encodeText(text))
+      safeWrite(liveSocket, frame.encodeClientText(text))
     }, (kind) => { if (kind === 'close') liveSocket.destroy() })
     socket.on('data', (chunk) => clientReader.push(chunk))
   })

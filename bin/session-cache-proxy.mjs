@@ -29,6 +29,9 @@ const argv = process.argv.slice(2)
 let port = Number(process.env.DSH_PROXY_PORT ?? 7091)
 let root = resolve(process.env.DSH_CACHE_ROOT ?? '/var/lib/dsh-mobile-cache')
 let upstream = process.env.DSH_UPSTREAM ?? 'http://127.0.0.1:3080'
+// The live half travels the tunnel. On the entry host the tunnel's vhost answers by Host header,
+// so the upstream address alone is not enough: it must also carry the public name.
+let upstreamHost = process.env.DSH_UPSTREAM_HOST ?? ''
 let wsPath = process.env.DSH_WS_PATH ?? '/ws/mobile'
 let tokensFile = process.env.DSH_CACHE_TOKENS ?? ''
 for (let index = 0; index < argv.length; index += 1) {
@@ -36,6 +39,7 @@ for (let index = 0; index < argv.length; index += 1) {
   if (arg === '--port') { port = Number(argv[++index]); continue }
   if (arg === '--root') { root = resolve(argv[++index]); continue }
   if (arg === '--upstream') { upstream = argv[++index]; continue }
+  if (arg === '--upstream-host') { upstreamHost = argv[++index]; continue }
   if (arg === '--ws-path') { wsPath = argv[++index]; continue }
   if (arg === '--tokens') { tokensFile = resolve(argv[++index]); continue }
   if (arg === '--help' || arg === '-h') {
@@ -141,6 +145,12 @@ function cachedEvents(sessionId) {
 }
 
 // --- history shaping, mirroring the gateway so a phone cannot tell the difference ---
+//
+// The gateway caps a page at 256 KB on its opening read because every byte travels the desktop's
+// upstream. Here the bytes are already local and the wire is the VPS's own 8.3 MB/s downstream, so
+// the cap only costs round trips: a 10866-event Session would take 118 pages, and at 173 ms RTT
+// that is 20 seconds of pure waiting before any data moves. The protocol's own per-frame ceiling is
+// 4 MiB, which is what this uses.
 const HISTORY_DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 const HISTORY_TOOL_RESULT_MAX_CHARS = 2000
 
@@ -198,7 +208,12 @@ function capHistoryEvents(events, maxBytes, trim, beforeSeq) {
 
 /** Build the wire frame a phone expects, from cached events. */
 function historyFrame(message, cached) {
-  const capped = capHistoryEvents(cached.events, HISTORY_DEFAULT_MAX_BYTES, message.view === 'conversation', message.beforeSeq)
+  // A larger page than the gateway would send: the bytes are local, so the only cost is the frame
+  // the protocol already permits.
+  const budget = Number.isSafeInteger(message.maxBytes) && message.maxBytes > 0
+    ? Math.min(message.maxBytes, HISTORY_DEFAULT_MAX_BYTES)
+    : HISTORY_DEFAULT_MAX_BYTES
+  const capped = capHistoryEvents(cached.events, budget, message.view === 'conversation', message.beforeSeq)
   const oldest = capped.events[0]?.seq ?? cached.events[0]?.seq
   const lastSeq = cached.events.length === 0 ? 0 : cached.events[cached.events.length - 1].seq
   return {
@@ -224,13 +239,12 @@ server.on('upgrade', (request, socket, head) => {
   if (url.pathname !== wsPath) { socket.destroy(); return }
   const key = request.headers['sec-websocket-key']
   if (typeof key !== 'string') { socket.destroy(); return }
-  const accept = createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
-  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n')
 
-  // Forward the paired credential to the desktop for the live half. The cache serves history, so a
-  // live-only write goes upstream unchanged and the gateway stays the single authority on identity.
+  // The upstream decides whether this connection is allowed: it owns device identity, and a gateway
+  // that refused would otherwise be reported to the phone as a successful upgrade of a socket that
+  // has no peer. So the handshake is opened upstream first and its outcome relayed verbatim.
   const headers = {}
-  for (const name of ['authorization', 'sec-websocket-protocol', 'x-dsh-device-id', 'x-dsh-device-token', 'cookie']) {
+  for (const name of ['authorization', 'sec-websocket-protocol', 'x-dsh-device-id', 'x-dsh-device-token', 'cookie', 'origin', 'user-agent']) {
     const value = request.headers[name]
     if (value !== undefined) headers[name] = value
   }
@@ -240,17 +254,41 @@ server.on('upgrade', (request, socket, head) => {
     port: upstreamUrl.port,
     path: upstreamUrl.pathname,
     method: 'GET',
-    headers: { ...headers, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' },
+    headers: {
+      ...headers,
+      ...(upstreamHost === '' ? {} : { Host: upstreamHost }),
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Key': key,
+      'Sec-WebSocket-Version': '13',
+    },
   })
+
   live.on('upgrade', (response2, liveSocket, liveHead) => {
+    // Relay the upstream's own handshake, including the subprotocol it negotiated: a phone that
+    // asked for dsh-mobile-v1 must see it echoed or it will not treat the socket as established.
+    const accept = response2.headers['sec-websocket-accept']
+    const protocol = response2.headers['sec-websocket-protocol']
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n'
+      + 'Upgrade: websocket\r\n'
+      + 'Connection: Upgrade\r\n'
+      + 'Sec-WebSocket-Accept: ' + String(accept) + '\r\n'
+      + (protocol === undefined ? '' : 'Sec-WebSocket-Protocol: ' + String(protocol) + '\r\n')
+      + '\r\n',
+    )
+    if (head.length > 0) liveSocket.write(head)
     if (liveHead.length > 0) socket.write(liveHead)
-    const toClient = (text) => socket.write(frame.encode(JSON.parse(text)))
-    const liveReader = new FrameReader(toClient, () => {})
+
+    const liveReader = new FrameReader((text) => {
+      if (!socket.destroyed) socket.write(frame.encode(JSON.parse(text)))
+    }, () => {})
     liveSocket.on('data', (chunk) => liveReader.push(chunk))
-    liveSocket.on('close', () => socket.destroy())
-    liveSocket.on('error', () => socket.destroy())
-    // From here the client's frames are examined: history answers locally, everything else forwards.
-    const seen = new Set()
+    liveSocket.on('close', () => { if (!socket.destroyed) socket.destroy() })
+    liveSocket.on('error', () => { if (!socket.destroyed) socket.destroy() })
+
+    // The client's frames are examined: a history request for a cached Session is answered from
+    // local storage, and every other frame is forwarded unchanged.
     const clientReader = new FrameReader((text) => {
       let message
       try { message = JSON.parse(text) } catch { liveSocket.write(text); return }
@@ -258,24 +296,42 @@ server.on('upgrade', (request, socket, head) => {
         let cached
         try { cached = cachedEvents(message.sessionId) } catch { cached = undefined }
         if (cached !== undefined && cached.events.length > 0) {
-          seen.add(message.sessionId)
           socket.write(frame.encode(historyFrame(message, cached)))
           return
         }
       }
       liveSocket.write(text)
-    }, (kind, payload) => {
-      if (kind === 'ping') { /* the client's ping is answered by the live socket's own keepalive */ }
-      if (kind === 'close') liveSocket.destroy()
-      void payload
-    })
+    }, (kind) => { if (kind === 'close') liveSocket.destroy() })
     socket.on('data', (chunk) => clientReader.push(chunk))
   })
-  live.on('error', () => socket.destroy())
+
+  // A refusal is the upstream's answer, not the proxy's: pass its status and body through so the
+  // phone can act on it (401 means re-pair, and only the gateway may say that).
+  live.on('response', (response2) => {
+    const chunks = []
+    response2.on('data', (chunk) => chunks.push(chunk))
+    response2.on('end', () => {
+      if (socket.destroyed) return
+      const body = Buffer.concat(chunks)
+      socket.write('HTTP/1.1 ' + String(response2.statusCode ?? 502) + ' ' + String(response2.statusMessage ?? 'Bad Gateway') + '\r\nContent-Length: ' + String(body.length) + '\r\nConnection: close\r\n\r\n')
+      socket.end(body)
+    })
+  })
+  live.on('error', () => {
+    if (socket.destroyed) return
+    socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n')
+    socket.end()
+  })
+  live.setTimeout(20000, () => {
+    live.destroy()
+    if (!socket.destroyed) {
+      socket.write('HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n')
+      socket.end()
+    }
+  })
   live.end()
-  if (head.length > 0) socket.unshift(head)
 })
 
 server.listen(port, '127.0.0.1', () => {
-  console.log('session-cache-proxy: listening on 127.0.0.1:' + String(port) + ' root=' + root + ' upstream=' + upstream)
+  console.log('session-cache-proxy: listening on 127.0.0.1:' + String(port) + ' root=' + root + ' upstream=' + upstream + (upstreamHost === '' ? '' : ' host=' + upstreamHost))
 })

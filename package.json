@@ -1,7 +1,7 @@
 {
   "name": "@sparkelf/dsh-plugin-mobile-gateway",
-  "version": "0.8.3",
-  "description": "Mobile gateway for DSH 0.1.7 (Session format 4), carrying the fork's format adaptation: v3 rows are lifted on read so a Session written by an earlier release still opens. Per-session Agent preset selection, live preset updates, and the upstream LAN/pairing protocol are unchanged.",
+  "version": "0.9.0",
+  "description": "Mobile gateway for DSH 0.1.7 (Session format 4) with an entry-VPS Session cache. Reads DSH 0.1.7 Session format 4 and lifts retired v3 message shapes on read; a companion cache service plus gateway proxy let a phone fetch history from the entry host at 109 MB/s instead of through the desktop's 0.9 MB/s upstream. Per-session Agent preset selection, live preset updates, and the upstream LAN/pairing protocol are unchanged.",
   "main": "lib/index.mjs",
   "files": [
     "bin",
@@ -26,7 +26,7 @@
   },
   "bin": "bin/setup-ip.mjs",
   "scripts": {
-    "test": "node test/wire-json.test.mjs && node test/setup-ip.test.mjs && node test/host-adapter.test.mjs && node test/session-preset.test.mjs && node test/session-follower.test.mjs && node test/gateway.test.mjs && node test/auth.test.mjs && node test/lan.test.mjs && node test/multi-gateway.test.mjs"
+    "test": "node test/wire-json.test.mjs && node test/setup-ip.test.mjs && node test/host-adapter.test.mjs && node test/session-preset.test.mjs && node test/session-follower.test.mjs && node test/session-cache.test.mjs && node test/session-cache-proxy.test.mjs && node test/gateway.test.mjs && node test/auth.test.mjs && node test/lan.test.mjs && node test/multi-gateway.test.mjs"
   },
   "exports": {
     ".": "./lib/index.mjs",

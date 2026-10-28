@@ -18,6 +18,12 @@
  * Usage:
  *   session-cache-proxy.mjs [--port 7091] [--root /var/lib/dsh-mobile-cache]
  *                           [--upstream http://127.0.0.1:3080] [--ws-path /ws/mobile]
+ *                           --legacy-cache
+ *
+ * DEPRECATED: this proxy answers history from the disk cache and therefore
+ * depends on Session history having been written to the entry host. It refuses
+ * to start unless --legacy-cache (or DSH_LEGACY_SESSION_CACHE=1) is passed
+ * explicitly. Prefer bin/stateless-gateway.mjs; see docs/stateless-migration.md.
  */
 import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -34,6 +40,7 @@ let upstream = process.env.DSH_UPSTREAM ?? 'http://127.0.0.1:3080'
 let upstreamHost = process.env.DSH_UPSTREAM_HOST ?? ''
 let wsPath = process.env.DSH_WS_PATH ?? '/ws/mobile'
 let tokensFile = process.env.DSH_CACHE_TOKENS ?? ''
+let legacyOptIn = process.env.DSH_LEGACY_SESSION_CACHE === '1'
 // When set, every frame's kind and size is logged. Used to see what a client actually asked for and
 // what it was given, which is the only way to tell a client that is waiting from one that is retrying.
 const trace = process.env.DSH_PROXY_TRACE === '1'
@@ -45,12 +52,18 @@ for (let index = 0; index < argv.length; index += 1) {
   if (arg === '--upstream-host') { upstreamHost = argv[++index]; continue }
   if (arg === '--ws-path') { wsPath = argv[++index]; continue }
   if (arg === '--tokens') { tokensFile = resolve(argv[++index]); continue }
+  if (arg === '--legacy-cache') { legacyOptIn = true; continue }
   if (arg === '--help' || arg === '-h') {
-    console.log('usage: session-cache-proxy.mjs [--port 7091] [--root <dir>] [--upstream <url>] [--ws-path /ws/mobile] [--tokens <file>]')
+    console.log('usage: session-cache-proxy.mjs [--port 7091] [--root <dir>] [--upstream <url>] [--ws-path /ws/mobile] [--tokens <file>] --legacy-cache')
     process.exit(0)
   }
   throw new Error('unknown option: ' + arg)
 }
+if (!legacyOptIn) {
+  console.error('session-cache-proxy: disabled by default. The disk-backed cache is deprecated; use bin/stateless-gateway.mjs instead. To run the legacy proxy explicitly, pass --legacy-cache (not recommended; it depends on Session history written under ' + root + ').')
+  process.exit(2)
+}
+console.warn('session-cache-proxy: WARNING legacy disk cache proxy enabled; history reads depend on ' + root)
 
 /** Accepted device credential hashes; a read requires one of them. */
 function tokenHashes() {

@@ -706,6 +706,8 @@ WebUI、App 或其他客户端造成的变化通过以下帧主动推送：
     "projections": { "asOfSeq": 200, "values": { "tokenUsage": {...}, "contextPressure": {...}, "permissions": {...}, "sessionStats": {...} } } }
 ```
 
+> **入口部署说明（无状态，默认）**：公网入口的 `stateless-gateway` 只透明转发本节协议，不改变 `history` 请求/响应字段。入口默认不缓存历史，历史由桌面网关按需生成并流式返回；重启入口不会留下历史副本。只有显式启用进程内缓存时，才可能对带 `beforeSeq` 的不可变历史页做有界 TTL 缓存；不带 `beforeSeq` 的首屏永远回源。详见 [无状态入口设计](DESIGN-vps-cache.md)。
+
 图片引用结构：
 
 ```json
@@ -1101,6 +1103,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 - `/ws/mobile` 的移动网关默认关闭；本机 WebUI 手动开启后，若 5 分钟内没有设备成功连接会自动关闭
 - 网关开启后仍要求已配对设备凭证；不要把 `requireAuth` 设为 `false` 后暴露到网络
 - `/mgw/*` 是配对/吊销管理面，默认只允许本机访问；公网代理只应转发 `/ws/mobile`
+- 公网入口应运行无状态的 `stateless-gateway`：它只转发 `/ws/mobile`，不写 Session 历史或设备凭据；历史按需回源桌面网关。不要为了加速而在入口落盘完整 Session，也不要把 `/healthz`、`/cache/` 暴露到公网
 - `/mgw/public-setup` 仅供本机 WebUI 调用，通过受限 Unix Socket 请求 root Helper；Helper 只接受状态查询以及“公网 IPv4 + 当前 DSH 端口”的固定 Nginx 配置操作，不接受命令或文件路径
 - DSH HTTP Server 本身没有 TLS、认证或 Origin policy；公网必须使用 TLS 反向代理和 `wss://`
 - 长期 token 只保存在 iOS Keychain；服务端磁盘仅保存摘要

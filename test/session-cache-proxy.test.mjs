@@ -51,6 +51,7 @@ const child = spawn(process.execPath, [
   '--port', String(port),
   '--root', cacheRoot,
   '--upstream', 'http://127.0.0.1:' + String(upstreamPort),
+  '--legacy-cache',
 ], { stdio: ['ignore', 'pipe', 'pipe'] })
 let stderr = ''
 child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
@@ -161,6 +162,7 @@ try {
     new URL('../bin/session-cache-proxy.mjs', import.meta.url).pathname,
     '--port', String(proxyPort), '--root', cacheRoot,
     '--upstream', 'http://127.0.0.1:' + String(upstreamPort),
+    '--legacy-cache',
   ], { stdio: ['ignore', 'pipe', 'pipe'] })
   try {
     await new Promise((resolve) => setTimeout(resolve, 500))

@@ -20,6 +20,7 @@ const child = spawn(process.execPath, [
   '--port', String(port),
   '--root', path.join(temp, 'cache'),
   '--secret', SECRET,
+  '--legacy-cache',
 ], { stdio: ['ignore', 'pipe', 'pipe'] })
 
 let stderr = ''

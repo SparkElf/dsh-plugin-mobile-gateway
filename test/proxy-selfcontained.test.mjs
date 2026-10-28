@@ -50,15 +50,24 @@ function startAndWaitFor(args, readyPattern, timeout = 12_000) {
 fs.mkdirSync('/tmp/selfcontained-cache', { recursive: true })
 
 const cache = await startAndWaitFor(
-  [path.join(BIN, 'session-cache.mjs'), '--port', '17702', '--root', '/tmp/selfcontained-cache', '--secret', 'selfcontained-test'],
+  [path.join(BIN, 'session-cache.mjs'), '--port', '17702', '--root', '/tmp/selfcontained-cache', '--secret', 'selfcontained-test', '--legacy-cache'],
   /listening on/,
 )
 assert.match(cache.stdout, /listening on 127\.0\.0\.1:17702/)
 
 const proxy = await startAndWaitFor(
-  [path.join(BIN, 'session-cache-proxy.mjs'), '--port', '17703', '--root', '/tmp/selfcontained-cache'],
+  [path.join(BIN, 'session-cache-proxy.mjs'), '--port', '17703', '--root', '/tmp/selfcontained-cache', '--legacy-cache'],
   /listening on/,
 )
 assert.match(proxy.stdout, /listening on 127\.0\.0\.1:17703/)
+
+// The stateless entry is the supported path and must become ready without a
+// cache root, a token file, or any other local state.
+const stateless = await startAndWaitFor(
+  [path.join(BIN, 'stateless-gateway.mjs'), '--port', '17704', '--upstream', 'http://127.0.0.1:9'],
+  /listening on/,
+)
+assert.match(stateless.stdout, /mode=stateless cache=off/)
+assert.match(stateless.stdout, /upstream=http:\/\/127\.0\.0\.1:9/)
 
 console.log('PROXY SELF-CONTAINMENT TESTS PASSED')

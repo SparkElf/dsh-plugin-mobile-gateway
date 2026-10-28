@@ -14,6 +14,12 @@
  * Usage:
  *   push-session-cache.mjs --secret <value> [--home /root/.dsh] [--endpoint https://...]
  *                          [--once] [--interval 300] [--max-sessions 20] [--rate 200]
+ *                          --legacy-cache
+ *
+ * DEPRECATED: pushing snapshots exists only to fill the entry host's disk cache.
+ * It refuses to run unless --legacy-cache (or DSH_LEGACY_SESSION_CACHE=1) is
+ * passed explicitly. The stateless entry gateway streams history from this host
+ * on demand and needs no pusher; see docs/stateless-migration.md.
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
@@ -29,6 +35,7 @@ let once = false
 let intervalSeconds = 300
 let maxSessions = 20
 let rateBytesPerSecond = 200 * 1024
+let legacyOptIn = process.env.DSH_LEGACY_SESSION_CACHE === '1'
 for (let index = 0; index < argv.length; index += 1) {
   const arg = argv[index]
   if (arg === '--secret') { secret = argv[++index]; continue }
@@ -38,12 +45,18 @@ for (let index = 0; index < argv.length; index += 1) {
   if (arg === '--interval') { intervalSeconds = Number(argv[++index]); continue }
   if (arg === '--max-sessions') { maxSessions = Number(argv[++index]); continue }
   if (arg === '--rate') { rateBytesPerSecond = Number(argv[++index]) * 1024; continue }
+  if (arg === '--legacy-cache') { legacyOptIn = true; continue }
   if (arg === '--help' || arg === '-h') {
-    console.log('usage: push-session-cache.mjs --secret <value> [--home <dir>] [--endpoint <url>] [--once] [--interval 300] [--max-sessions 20] [--rate 200]')
+    console.log('usage: push-session-cache.mjs --secret <value> [--home <dir>] [--endpoint <url>] [--once] [--interval 300] [--max-sessions 20] [--rate 200] --legacy-cache')
     process.exit(0)
   }
   throw new Error('unknown option: ' + arg)
 }
+if (!legacyOptIn) {
+  console.error('push-session-cache: disabled by default. It exists only to fill the deprecated entry disk cache. Use bin/stateless-gateway.mjs instead; to run it explicitly, pass --legacy-cache (not recommended).')
+  process.exit(2)
+}
+console.warn('push-session-cache: WARNING legacy disk cache push enabled; Session snapshots will be uploaded to ' + endpoint)
 if (secret === '') throw new Error('push-session-cache: --secret or DSH_CACHE_SECRET is required')
 
 /** Sessions live one directory deep, under a project directory whose name encodes the cwd. */

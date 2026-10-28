@@ -61,6 +61,59 @@ endpoints:
 
 测试结果与人工步骤见 [验收报告](docs/multi-gateway-phase1-acceptance.md)，完成范围见 [多网关待办](docs/multi-gateway-todo.md)。
 
+## 无状态公网入口（默认，推荐）
+
+公网路径上的 entry 主机不再保存任何 Session 历史或设备凭据。手机连接 entry 的 `wss://<入口>/ws/mobile`，entry 只做 WebSocket 透明转发，历史按需从桌面机读取：
+
+```text
+手机 → nginx (TLS) → 127.0.0.1:7091 stateless-gateway
+     → DSH_UPSTREAM=127.0.0.1:7080（Host: dsh.tokensfree.eu.cc，WS /ws/mobile）
+     → 桌面机 DSH 移动网关
+```
+
+- 入口不写 Session 历史，不创建 `/var/lib/dsh-mobile-cache`，也不保存设备 token；设备鉴权仍由桌面网关在握手时完成。
+- 历史、实时事件、配对、LAN/多网关、live session 和 Agent preset 都走同一条现有协议，入口不改变 `dsh-mobile-v1`。
+- entry 只监听 loopback；TLS、访问控制和 `/mgw/*` 隔离仍由 nginx 与桌面网关负责。
+- 入口进程重启后没有可恢复状态；重新连接即可，历史会再次从桌面机流式读取。
+
+在 entry 主机启动（只需要 Node，不需要 `npm install`；路径按实际部署替换）：
+
+```bash
+cd /path/to/dsh-plugin-mobile-gateway
+DSH_UPSTREAM=http://127.0.0.1:7080 \
+DSH_UPSTREAM_HOST=dsh.tokensfree.eu.cc \
+DSH_WS_PATH=/ws/mobile \
+node bin/stateless-gateway.mjs --port 7091
+```
+
+检查入口状态：
+
+```bash
+curl -s http://127.0.0.1:7091/healthz
+```
+
+响应应包含 `"mode":"stateless"` 和 `"cache":{"enabled":false,...}`。`/healthz` 只应在本机访问，不要通过 nginx 暴露到公网。其他部署可用 `--upstream` / `--upstream-host` 覆盖上游地址和隧道 Host；Host 必须与该隧道的 vhost 一致。
+
+### 可选的内存历史缓存（默认关闭）
+
+如果同一入口进程会反复读取相同的**较早历史页**，可以显式开启有界、易失的进程内 TTL 缓存：
+
+```bash
+node bin/stateless-gateway.mjs --port 7091 \
+  --memory-cache --memory-cache-ttl 60 \
+  --memory-cache-entries 16 --memory-cache-bytes 33554432
+```
+
+- 只缓存带 `beforeSeq` 的历史页。这类页是 Session 日志的不可变前缀；首屏（不带 `beforeSeq`）可能随新一轮对话增长，永远回源。
+- 缓存不落盘、重启即清、不保存任何凭据；条目数和总字节数都有上限。
+- 它只能减少重复的旧页请求，**不能**加快冷启动首屏；首屏仍受桌面机上行带宽限制。
+
+### 旧磁盘缓存（已废弃）
+
+`bin/session-cache.mjs`、`bin/session-cache-proxy.mjs` 和 `bin/push-session-cache.mjs` 仍保留兼容，但**必须显式加 `--legacy-cache`**（或设置 `DSH_LEGACY_SESSION_CACHE=1`）才会启动，否则直接退出。旧模式会把完整 Session 历史写入 `/var/lib/dsh-mobile-cache`，并依赖 `dsh-mobile-session-cache.service` 与 `dsh-mobile-cache-proxy.service` 两个常驻服务；不推荐用于新部署，也不应在公网入口继续运行。
+
+从旧缓存切换到无状态入口的步骤见 [无状态迁移说明](docs/stateless-migration.md)；设计取舍见 [无状态入口设计](DESIGN-vps-cache.md)。
+
 ## 配套 iOS 客户端
 
 [DeepSeek Harness Mobile](https://github.com/Clarklevis1995/dsh-mobile) 是本仓库的兄弟项目。它是面向 iOS 17+ 的 SwiftUI 原生客户端，支持工作区与会话、工作区内创建文件夹、历史和实时对话、图片、Agent 执行轨迹、Human-in-the-loop，以及由网关配置驱动的命令、技能、模型与权限菜单。
@@ -269,6 +322,8 @@ sudo env "PATH=$PATH" npx --yes dsh-plugin-mobile-gateway@latest remove-helper
 | iOS 收到 `401` | 在 WebUI 重新生成二维码并配对 |
 | Linux 服务器公网连接超时 | 检查云安全组、服务器防火墙和 TCP `80/443` |
 | Linux 服务器公网地址没有显示 | 在“移动设备 → 公网接入”填写公网 IPv4 并点击更新 |
+| 公网首次打开会话较慢 | 无状态入口按需从桌面机读取历史，受桌面机上行带宽限制；不要为此重新启用磁盘缓存。较早历史页可选用进程内 `--memory-cache`，但首屏仍会回源 |
+| 升级后旧缓存服务仍在运行 | 按[迁移说明](docs/stateless-migration.md)停用 `dsh-mobile-session-cache.service` / `dsh-mobile-cache-proxy.service`，删除 `/var/lib/dsh-mobile-cache`，并改用 `bin/stateless-gateway.mjs` |
 | 需要查看服务端日志 | 执行 `tail -f /tmp/mobile-gateway.log` |
 
 ## 源码开发
@@ -276,6 +331,14 @@ sudo env "PATH=$PATH" npx --yes dsh-plugin-mobile-gateway@latest remove-helper
 ```bash
 dsh plugin --profile web add file:/absolute/path/to/dsh-plugin-mobile-gateway
 npm test
+```
+
+入口无状态网关可以单独启动和检查：
+
+```bash
+node bin/stateless-gateway.mjs --help
+node bin/stateless-gateway.mjs --port 7091 --upstream http://127.0.0.1:7080
+curl -s http://127.0.0.1:7091/healthz
 ```
 
 源码修改后需要重新安装插件并重启 `dsh web`。

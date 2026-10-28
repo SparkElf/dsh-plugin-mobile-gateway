@@ -16,7 +16,12 @@
  * secret, and a phone proves read access with the same device id and token it paired with. A
  * request without either is refused before any file is touched.
  *
- * Usage: session-cache.mjs [--port 7090] [--root /var/lib/dsh-mobile-cache] [--secret <value>]
+ * Usage: session-cache.mjs [--port 7090] [--root /var/lib/dsh-mobile-cache] [--secret <value>] --legacy-cache
+ *
+ * DEPRECATED: this service writes complete Session history to disk, which is
+ * exactly what the stateless entry gateway removes. It refuses to start unless
+ * --legacy-cache (or DSH_LEGACY_SESSION_CACHE=1) is passed explicitly. Prefer
+ * bin/stateless-gateway.mjs; see docs/stateless-migration.md.
  */
 import { createServer } from 'node:http'
 import { createHash, timingSafeEqual } from 'node:crypto'
@@ -27,17 +32,24 @@ const argv = process.argv.slice(2)
 let port = Number(process.env.DSH_CACHE_PORT ?? 7090)
 let root = resolve(process.env.DSH_CACHE_ROOT ?? '/var/lib/dsh-mobile-cache')
 let secret = process.env.DSH_CACHE_SECRET ?? ''
+let legacyOptIn = process.env.DSH_LEGACY_SESSION_CACHE === '1'
 for (let index = 0; index < argv.length; index += 1) {
   const arg = argv[index]
   if (arg === '--port') { port = Number(argv[++index]); continue }
   if (arg === '--root') { root = resolve(argv[++index]); continue }
   if (arg === '--secret') { secret = argv[++index]; continue }
+  if (arg === '--legacy-cache') { legacyOptIn = true; continue }
   if (arg === '--help' || arg === '-h') {
-    console.log('usage: session-cache.mjs [--port 7090] [--root <dir>] [--secret <value>]')
+    console.log('usage: session-cache.mjs [--port 7090] [--root <dir>] [--secret <value>] --legacy-cache')
     process.exit(0)
   }
   throw new Error('unknown option: ' + arg)
 }
+if (!legacyOptIn) {
+  console.error('session-cache: disabled by default. This service writes complete Session history to disk. Use bin/stateless-gateway.mjs instead; to run the deprecated cache explicitly, pass --legacy-cache (not recommended).')
+  process.exit(2)
+}
+console.warn('session-cache: WARNING legacy disk cache enabled; Session history will be written under ' + root)
 if (secret === '') throw new Error('session-cache: --secret or DSH_CACHE_SECRET is required')
 
 mkdirSync(root, { recursive: true })
